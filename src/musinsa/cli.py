@@ -1,65 +1,87 @@
 from __future__ import annotations
 
-import argparse
+import sys
+from pathlib import Path
+from typing import Any, Mapping
 
-from .config import DEFAULT_OUTPUT
+import yaml
+
 from .pipeline import main
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="무신사 스탠다드 여성 상품 SKU 계산용 엑셀 생성기 데모"
-    )
+CONFIG_PATH = Path("commands.yaml")
+MAIN_KEYS = {
+    "output",
+    "max_products",
+    "max_scrolls",
+    "delay",
+    "headless",
+    "skip_options",
+    "workers",
+    "browser",
+}
 
-    parser.add_argument(
-        "--output",
-        default=DEFAULT_OUTPUT,
-        help=f"저장할 엑셀 파일명. 기본값: {DEFAULT_OUTPUT}",
-    )
-    parser.add_argument(
-        "--max-products",
-        type=int,
-        default=10,
-        help="카테고리별 최대 상품 수. 전체 수집은 0 입력. 기본값: 10",
-    )
-    parser.add_argument(
-        "--max-scrolls",
-        type=int,
-        default=80,
-        help="상품 목록 페이지에서 스크롤하며 누적 수집할 최대 횟수. 기본값: 80",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.8,
-        help="상세 페이지 사이 대기 시간, 초 단위. 기본값: 0.8",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="브라우저 화면을 띄우지 않고 실행합니다.",
-    )
-    parser.add_argument(
-        "--skip-options",
-        action="store_true",
-        help="상세 페이지 옵션 수집을 건너뛰고 상품 목록만 저장합니다.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="병렬 Selenium 드라이버 개수. 기본값: 4 (Firefox 인스턴스당 ~300MB 메모리).",
-    )
-    parser.add_argument(
-        "--browser",
-        choices=["auto", "firefox", "chrome"],
-        default="auto",
-        help="사용할 브라우저. auto는 환경에서 자동 감지. 기본값: auto",
-    )
 
-    return parser.parse_args()
+def _load_yaml(path: Path) -> Mapping[str, Any]:
+    if not path.exists():
+        raise SystemExit(
+            f"{path} 파일을 찾지 못했습니다. 로컬 실행 옵션은 터미널 플래그 대신 "
+            f"{path}에서 설정하세요."
+        )
+
+    with path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    if not isinstance(data, Mapping):
+        raise SystemExit(f"{path} 최상위 값은 YAML mapping이어야 합니다.")
+    return data
+
+
+def _select_command(data: Mapping[str, Any], path: Path) -> dict[str, Any]:
+    if "commands" not in data:
+        command = dict(data)
+        command_name = None
+    else:
+        commands = data.get("commands")
+        if not isinstance(commands, Mapping):
+            raise SystemExit(f"{path}의 commands 값은 YAML mapping이어야 합니다.")
+
+        command_name = str(data.get("default", "default"))
+        if command_name not in commands:
+            available = ", ".join(str(name) for name in commands)
+            raise SystemExit(
+                f"{path}에서 default={command_name!r} 명령을 찾지 못했습니다. "
+                f"사용 가능: {available}"
+            )
+
+        command_value = commands[command_name]
+        if not isinstance(command_value, Mapping):
+            raise SystemExit(f"{path}의 commands.{command_name} 값은 YAML mapping이어야 합니다.")
+        command = dict(command_value)
+
+    unknown_keys = sorted(set(command) - MAIN_KEYS)
+    if unknown_keys:
+        prefix = f"commands.{command_name}" if command_name else "최상위"
+        raise SystemExit(
+            f"{path}의 {prefix}에 알 수 없는 옵션이 있습니다: {', '.join(unknown_keys)}"
+        )
+
+    return command
+
+
+def load_command_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    """commands.yaml에서 실행 옵션을 읽어 pipeline.main kwargs로 반환합니다."""
+    data = _load_yaml(path)
+    return _select_command(data, path)
 
 
 def entrypoint() -> None:
-    args = parse_args()
-    main(**vars(args))
+    if len(sys.argv) > 1:
+        received = " ".join(sys.argv[1:])
+        raise SystemExit(
+            "터미널 플래그는 더 이상 사용하지 않습니다. "
+            f"{CONFIG_PATH}를 수정한 뒤 `uv run python -m musinsa`로 실행하세요. "
+            f"받은 인자: {received}"
+        )
+
+    main(**load_command_config())

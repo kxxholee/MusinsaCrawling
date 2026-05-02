@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import WebDriverException
@@ -21,6 +25,14 @@ from .utils import (
     parse_discount,
     parse_int_price,
 )
+
+PRODUCT_RENDER_TIMEOUT_SECONDS = 12.0
+PRODUCT_RENDER_POLL_SECONDS = 0.5
+EMPTY_LISTING_RETRY_COUNT = 1
+PLP_API_URL = "https://api.musinsa.com/api2/dp/v2/plp/goods"
+PLP_API_PAGE_SIZE = 30
+PLP_API_SLEEP_SECONDS = 0.2
+PLP_API_TIMEOUT_SECONDS = 10
 
 
 def parse_product_items_from_html(html: str) -> List[Dict[str, Any]]:
@@ -113,11 +125,152 @@ def parse_product_items_from_html(html: str) -> List[Dict[str, Any]]:
     return results
 
 
+def _format_won(value: Any) -> str:
+    try:
+        return f"{int(value):,}원"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _api_item_to_listing_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    price_text = _format_won(item.get("normalPrice") or item.get("price"))
+    sale_rate = item.get("saleRate") or item.get("couponSaleRate")
+    sale_text = f"{sale_rate}%" if sale_rate else ""
+    soldout_text = "품절" if item.get("isSoldOut") else "판매중"
+    lines = [
+        clean_text(item.get("goodsName", "")),
+        price_text,
+        sale_text,
+        soldout_text,
+        clean_text(item.get("displayGenderText", "")),
+    ]
+    lines = [line for line in lines if line]
+    goods_url = clean_text(item.get("goodsLinkUrl", ""))
+    goods_no = clean_text(item.get("goodsNo", ""))
+    if not goods_url and goods_no:
+        goods_url = f"https://www.musinsa.com/products/{goods_no}"
+
+    return {
+        "product_url": ensure_gender_filter_url(goods_url),
+        "product_name": clean_text(item.get("goodsName", "")),
+        "lines": lines,
+        "card_text": " | ".join(lines),
+        "image_url": clean_text(item.get("thumbnail", "")),
+    }
+
+
+def fetch_product_items_from_plp_api(
+    category_code: str,
+    max_products: Optional[int],
+) -> List[Dict[str, Any]]:
+    """무신사 PLP JSON API에서 브랜드 상품 목록을 수집한다."""
+    items, _api_confirmed = fetch_product_items_from_plp_api_checked(
+        category_code=category_code,
+        max_products=max_products,
+    )
+    return items
+
+
+def fetch_product_items_from_plp_api_checked(
+    category_code: str,
+    max_products: Optional[int],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """무신사 PLP JSON API에서 수집하고, API 응답 성공 여부를 함께 반환한다."""
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    page = 1
+    total_pages: Optional[int] = None
+    api_confirmed = False
+
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Origin": "https://www.musinsa.com",
+        "Referer": ensure_gender_filter_url(build_category_url(category_code)),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+            "Gecko/20100101 Firefox/124.0"
+        ),
+    }
+
+    while total_pages is None or page <= total_pages:
+        params = {
+            "gf": GENDER_FILTER,
+            "sortCode": "NEW",
+            "category": category_code,
+            "brand": BRAND,
+            "page": page,
+            "size": PLP_API_PAGE_SIZE,
+            "caller": "FLAGSHIP",
+        }
+        url = f"{PLP_API_URL}?{urlencode(params)}"
+        request = Request(url, headers=headers)
+
+        try:
+            with urlopen(request, timeout=PLP_API_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (OSError, URLError, json.JSONDecodeError) as exc:
+            log_info(f"[목록 API 실패] categoryCode={category_code} page={page}: {exc}")
+            return items, api_confirmed
+
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        goods_list = data.get("list") if isinstance(data, dict) else []
+        api_confirmed = True
+        if not isinstance(goods_list, list) or not goods_list:
+            break
+
+        pagination = data.get("pagination") if isinstance(data, dict) else {}
+        if isinstance(pagination, dict):
+            try:
+                total_pages = int(pagination.get("totalPages") or page)
+            except (TypeError, ValueError):
+                total_pages = page
+            if not pagination.get("hasNext") and page >= total_pages:
+                total_pages = page
+
+        for api_item in goods_list:
+            if not isinstance(api_item, dict):
+                continue
+            item = _api_item_to_listing_item(api_item)
+            product_url = ensure_gender_filter_url(item.get("product_url", ""))
+            product_id = extract_product_id(product_url)
+            key = product_id or product_url
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            if max_products is not None and len(items) >= max_products:
+                return items, api_confirmed
+
+        page += 1
+        time.sleep(PLP_API_SLEEP_SECONDS)
+
+    return items, api_confirmed
+
+
+def wait_for_product_items(
+    driver: Any,
+    timeout_seconds: float = PRODUCT_RENDER_TIMEOUT_SECONDS,
+    poll_seconds: float = PRODUCT_RENDER_POLL_SECONDS,
+) -> List[Dict[str, Any]]:
+    """상품 목록 JS/API 렌더링이 끝나 상품 링크가 DOM에 붙을 때까지 기다린다."""
+    deadline = time.monotonic() + timeout_seconds
+    last_items: List[Dict[str, Any]] = []
+
+    while time.monotonic() < deadline:
+        last_items = parse_product_items_from_html(driver.page_source)
+        if last_items:
+            return last_items
+        time.sleep(poll_seconds)
+
+    return last_items
+
+
 def scroll_and_collect_products(
     driver: Any,
     max_scrolls: int,
     wait_ms: int = 1000,
     max_products: Optional[int] = None,
+    initial_items: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """스크롤하며 매 DOM 스냅샷의 상품 후보를 누적."""
     items_by_key: Dict[str, Dict[str, Any]] = {}
@@ -126,7 +279,11 @@ def scroll_and_collect_products(
     last_seen_count = 0
 
     for index in range(max_scrolls + 1):
-        for item in parse_product_items_from_html(driver.page_source):
+        if index == 0 and initial_items is not None:
+            snapshot_items = initial_items
+        else:
+            snapshot_items = parse_product_items_from_html(driver.page_source)
+        for item in snapshot_items:
             product_url = ensure_gender_filter_url(item.get("product_url", ""))
             product_id = extract_product_id(product_url)
             key = product_id or product_url
@@ -173,15 +330,41 @@ def collect_products_from_category(
     category_url = build_category_url(category_code)
     log_info(f"[목록] {major_category} / {raw_category} / categoryCode={category_code}")
 
-    if not safe_goto(driver, category_url):
-        return []
-
-    close_common_popups(driver)
-    raw_items = scroll_and_collect_products(
-        driver=driver,
-        max_scrolls=max_scrolls,
+    raw_items, api_confirmed = fetch_product_items_from_plp_api_checked(
+        category_code=category_code,
         max_products=max_products,
     )
+    if raw_items:
+        log_info(f"[목록 API] {raw_category}: 후보 {len(raw_items)}")
+    elif api_confirmed:
+        log_info(f"[목록 API] {raw_category}: 상품 0개 확인")
+    else:
+        log_info(f"[목록 API] {raw_category}: 실패/미확인 → Selenium 렌더링 수집")
+
+    if not raw_items and not api_confirmed:
+        if not safe_goto(driver, category_url):
+            return []
+        close_common_popups(driver)
+        initial_items = wait_for_product_items(driver)
+        for attempt in range(EMPTY_LISTING_RETRY_COUNT + 1):
+            raw_items = scroll_and_collect_products(
+                driver=driver,
+                max_scrolls=max_scrolls,
+                max_products=max_products,
+                initial_items=initial_items,
+            )
+            if raw_items or attempt >= EMPTY_LISTING_RETRY_COUNT:
+                break
+
+            log_info(f"[목록 재시도] {raw_category}: 상품 링크 렌더링 대기 후에도 0개 → 새로고침")
+            try:
+                driver.refresh()
+                time.sleep(1.0)
+                close_common_popups(driver)
+            except WebDriverException:
+                safe_goto(driver, category_url)
+                close_common_popups(driver)
+            initial_items = wait_for_product_items(driver)
 
     rows: List[ProductRow] = []
     seen_ids_or_urls = set()

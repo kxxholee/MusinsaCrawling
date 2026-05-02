@@ -10,38 +10,46 @@ uv sync
 
 ## 실행
 
-CLI:
+로컬 실행 옵션은 터미널 플래그 대신 `commands.yaml`에서 관리합니다.
+
+```yaml
+# commands.yaml
+default: smoke
+
+commands:
+  smoke:
+    output: musinsa_standard_female_sku.xlsx
+    max_products: 10
+    max_scrolls: 80
+    delay: 0.8
+    headless: true
+    skip_options: false
+    workers: 2
+    browser: auto
+```
+
+`default` 값을 실행할 preset 이름으로 바꾼 뒤 실행합니다.
 
 ```bash
-# 카테고리당 10개 스모크 (헤드리스)
-uv run python -m musinsa --max-products 10 --headless
-
-# 전체 수집
-uv run python -m musinsa --max-products 0 --headless
-
-# 상세 옵션 수집 건너뛰기 (목록만)
-uv run python -m musinsa --max-products 10 --headless --skip-options
-
-# Chrome 강제 사용 (auto는 환경 자동 감지)
-uv run python -m musinsa --max-products 10 --headless --browser chrome
+uv run python -m musinsa
 ```
 
 기존 `mgen.py` shim도 그대로 작동합니다:
 
 ```bash
-uv run python mgen.py --max-products 10 --headless
+uv run python mgen.py
 ```
 
-### CLI 플래그
+### commands.yaml 옵션
 
-- `--output` 저장할 엑셀 파일명
-- `--max-products` 카테고리당 최대 상품 수 (0이면 전체)
-- `--max-scrolls` 목록 페이지 스크롤 누적 최대 횟수
-- `--delay` 상세 페이지 사이 대기 시간(초)
-- `--headless` 브라우저 화면 숨김
-- `--skip-options` 옵션 수집 생략
-- `--workers` 병렬 드라이버 개수
-- `--browser {auto,firefox,chrome}` 브라우저 선택
+- `output` 저장할 엑셀 파일명
+- `max_products` 카테고리당 최대 상품 수 (0이면 전체)
+- `max_scrolls` 목록 페이지 스크롤 누적 최대 횟수
+- `delay` 상세 페이지 사이 대기 시간(초)
+- `headless` 브라우저 화면 숨김
+- `skip_options` 옵션 수집 생략
+- `workers` 병렬 드라이버 개수
+- `browser` `auto`, `firefox`, `chrome` 중 하나
 
 ## Python에서 직접 호출 (Jupyter / Colab)
 
