@@ -82,8 +82,23 @@ else:
 !which chromium || which chromium-browser || which google-chrome
 !which chromedriver
 
+import os
+import shutil
 import sys
+
+chrome_binary = (
+    shutil.which("chromium")
+    or shutil.which("chromium-browser")
+    or shutil.which("google-chrome")
+)
+chromedriver = shutil.which("chromedriver")
+
+os.environ["MUSINSA_CHROME_BINARY"] = chrome_binary or ""
+os.environ["MUSINSA_CHROMEDRIVER"] = chromedriver or ""
+
 print(sys.executable)
+print("chrome:", os.environ["MUSINSA_CHROME_BINARY"])
+print("chromedriver:", os.environ["MUSINSA_CHROMEDRIVER"])
 
 from musinsa.browser import create_driver
 driver = create_driver(headless=True, browser="chrome")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ from .utils import ensure_gender_filter_url
 
 
 PAGE_LOAD_TIMEOUT = 30
+CHROME_BINARY_ENV = "MUSINSA_CHROME_BINARY"
+CHROMEDRIVER_ENV = "MUSINSA_CHROMEDRIVER"
 SNAP_FIREFOX = Path("/snap/firefox/current/usr/lib/firefox/firefox")
 SNAP_GECKODRIVER = Path("/snap/firefox/current/usr/lib/firefox/geckodriver")
 CHROME_BINARY_CANDIDATES = (
@@ -49,6 +52,15 @@ def _first_existing_executable(*paths: str) -> str | None:
     return None
 
 
+def _env_executable(name: str) -> str | None:
+    path = os.environ.get(name)
+    if not path:
+        return None
+    if Path(path).exists():
+        return path
+    raise RuntimeError(f"{name}={path} 경로가 존재하지 않습니다.")
+
+
 def _existing_executables(*paths: str | None) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -70,9 +82,11 @@ def _resolve_browser(browser: str) -> str:
 
     if SNAP_GECKODRIVER.exists() or shutil.which("geckodriver"):
         return "firefox"
-    chrome_binary = shutil.which("google-chrome") or shutil.which("chromium")
+    chrome_binary = _env_executable(CHROME_BINARY_ENV)
+    chrome_binary = chrome_binary or shutil.which("google-chrome") or shutil.which("chromium")
     chrome_binary = chrome_binary or _first_existing_executable(*CHROME_BINARY_CANDIDATES)
-    chromedriver = shutil.which("chromedriver") or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
+    chromedriver = _env_executable(CHROMEDRIVER_ENV)
+    chromedriver = chromedriver or shutil.which("chromedriver") or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
     if _CHROME_AVAILABLE and (chromedriver or chrome_binary):
         return "chrome"
     return "firefox"
@@ -111,11 +125,13 @@ def _create_chrome_driver(headless: bool) -> Any:
 
     options = ChromeOptions()
 
-    chrome_binary = (
+    chrome_binary = _env_executable(CHROME_BINARY_ENV)
+    chrome_binary = chrome_binary or (
         shutil.which("chromium")
         or shutil.which("chromium-browser")
         or shutil.which("google-chrome")
         or shutil.which("google-chrome-stable")
+        or _first_existing_executable(*CHROME_BINARY_CANDIDATES)
     )
 
     if chrome_binary:
@@ -123,6 +139,7 @@ def _create_chrome_driver(headless: bool) -> Any:
     else:
         raise RuntimeError(
             "Chrome/Chromium 실행 파일을 찾지 못했습니다. "
+            f"Colab에서 찾은 경로를 os.environ['{CHROME_BINARY_ENV}']에 넣거나, "
             "Colab에서 chromium 또는 chromium-browser를 설치하세요."
         )
 
@@ -140,11 +157,14 @@ def _create_chrome_driver(headless: bool) -> Any:
 
     options.set_capability("pageLoadStrategy", "eager")
 
-    chromedriver_path = shutil.which("chromedriver")
+    chromedriver_path = _env_executable(CHROMEDRIVER_ENV)
+    chromedriver_path = chromedriver_path or shutil.which("chromedriver")
+    chromedriver_path = chromedriver_path or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
 
     if not chromedriver_path:
         raise RuntimeError(
             "chromedriver를 찾지 못했습니다. "
+            f"Colab에서 찾은 경로를 os.environ['{CHROMEDRIVER_ENV}']에 넣거나, "
             "Colab에서 chromium-driver 또는 chromium-chromedriver를 설치하세요."
         )
 
