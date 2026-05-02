@@ -64,12 +64,25 @@ print(out_path)
 ### Google Colab
 
 ```python
-!git clone https://github.com/<user>/<repo>.git
-%cd <repo>
-!pip install -q -e .
+REPO_URL = "https://github.com/<user>/<repo>.git"
+REPO_DIR = "MusinsaCrawling"
+
+import os
+
+if os.path.isdir(REPO_DIR):
+    %cd {REPO_DIR}
+    !git pull
+else:
+    !git clone {REPO_URL} {REPO_DIR}
+    %cd {REPO_DIR}
+
+%pip install -q -e .
 !apt-get install -y -qq chromium-chromedriver
 
+import sys
+print(sys.executable)
 from musinsa.pipeline import main
+
 out_path = main(
     max_products=20,
     max_scrolls=80,
