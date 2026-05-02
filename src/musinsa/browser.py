@@ -28,6 +28,36 @@ from .utils import ensure_gender_filter_url
 PAGE_LOAD_TIMEOUT = 30
 SNAP_FIREFOX = Path("/snap/firefox/current/usr/lib/firefox/firefox")
 SNAP_GECKODRIVER = Path("/snap/firefox/current/usr/lib/firefox/geckodriver")
+CHROME_BINARY_CANDIDATES = (
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/opt/google/chrome/chrome",
+)
+CHROMEDRIVER_CANDIDATES = (
+    "/usr/bin/chromedriver",
+    "/usr/lib/chromium/chromedriver",
+    "/usr/lib/chromium-browser/chromedriver",
+)
+
+
+def _first_existing_executable(*paths: str) -> str | None:
+    for path in paths:
+        if path and Path(path).exists():
+            return path
+    return None
+
+
+def _existing_executables(*paths: str | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path or path in seen or not Path(path).exists():
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
 
 
 def _resolve_browser(browser: str) -> str:
@@ -40,7 +70,10 @@ def _resolve_browser(browser: str) -> str:
 
     if SNAP_GECKODRIVER.exists() or shutil.which("geckodriver"):
         return "firefox"
-    if _CHROME_AVAILABLE and (shutil.which("chromedriver") or shutil.which("chromium") or shutil.which("google-chrome")):
+    chrome_binary = shutil.which("google-chrome") or shutil.which("chromium")
+    chrome_binary = chrome_binary or _first_existing_executable(*CHROME_BINARY_CANDIDATES)
+    chromedriver = shutil.which("chromedriver") or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
+    if _CHROME_AVAILABLE and (chromedriver or chrome_binary):
         return "chrome"
     return "firefox"
 
@@ -77,17 +110,46 @@ def _create_chrome_driver(headless: bool) -> Any:
         raise RuntimeError("selenium.webdriver.chrome 가 import 되지 않습니다.")
 
     options = ChromeOptions()
+
+    chrome_binary = (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+    )
+
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    else:
+        raise RuntimeError(
+            "Chrome/Chromium 실행 파일을 찾지 못했습니다. "
+            "Colab에서 chromium 또는 chromium-browser를 설치하세요."
+        )
+
     if headless:
         options.add_argument("--headless=new")
+
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1440,1200")
     options.add_argument("--lang=ko-KR")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-software-rasterizer")
+
     options.set_capability("pageLoadStrategy", "eager")
 
     chromedriver_path = shutil.which("chromedriver")
-    service = ChromeService(executable_path=chromedriver_path) if chromedriver_path else None
+
+    if not chromedriver_path:
+        raise RuntimeError(
+            "chromedriver를 찾지 못했습니다. "
+            "Colab에서 chromium-driver 또는 chromium-chromedriver를 설치하세요."
+        )
+
+    service = ChromeService(executable_path=chromedriver_path)
+
     driver = webdriver.Chrome(service=service, options=options)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver

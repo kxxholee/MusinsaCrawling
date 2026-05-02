@@ -77,10 +77,18 @@ else:
     %cd {REPO_DIR}
 
 %pip install -q -e .
+!apt-get update -qq
 !apt-get install -y -qq chromium-chromedriver
+!which chromium || which chromium-browser || which google-chrome
+!which chromedriver
 
 import sys
 print(sys.executable)
+
+from musinsa.browser import create_driver
+driver = create_driver(headless=True, browser="chrome")
+driver.quit()
+
 from musinsa.pipeline import main
 
 out_path = main(
