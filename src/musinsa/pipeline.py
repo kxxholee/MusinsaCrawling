@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .categories import discover_category_tree
-from .config import BRAND, GENDER_FILTER
+from .config import BRAND, DEFAULT_OUTPUT, GENDER_FILTER
 from .detail import collect_detail_and_options
 from .driver_pool import DriverPool
 from .excel import save_excel
@@ -65,13 +65,13 @@ def dedupe_products(products: List[ProductRow]) -> List[ProductRow]:
 
 
 def main(
-    output: Any,
-    max_products: int,
-    max_scrolls: int,
-    delay: float,
-    headless: bool,
-    skip_options: bool,
-    workers: int,
+    output: Any = DEFAULT_OUTPUT,
+    max_products: int = 10,
+    max_scrolls: int = 80,
+    delay: float = 0.8,
+    headless: bool = False,
+    skip_options: bool = False,
+    workers: int = 4,
     browser: str = "auto",
 ) -> Path:
     max_products_resolved: Optional[int] = None if max_products == 0 else max_products
