@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from .utils import ensure_gender_filter_url
 
 
 PAGE_LOAD_TIMEOUT = 30
+CHROME_PROVIDER_ENV = "MUSINSA_CHROME_PROVIDER"
 CHROME_BINARY_ENV = "MUSINSA_CHROME_BINARY"
 CHROMEDRIVER_ENV = "MUSINSA_CHROMEDRIVER"
 SNAP_FIREFOX = Path("/snap/firefox/current/usr/lib/firefox/firefox")
@@ -72,6 +75,98 @@ def _existing_executables(*paths: str | None) -> list[str]:
     return result
 
 
+def _is_colab() -> bool:
+    try:
+        import google.colab  # type: ignore[import-not-found]  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _chrome_binary_candidates() -> list[str]:
+    return _existing_executables(
+        _env_executable(CHROME_BINARY_ENV),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        *CHROME_BINARY_CANDIDATES,
+    )
+
+
+def _chromedriver_candidates() -> list[str]:
+    return _existing_executables(
+        _env_executable(CHROMEDRIVER_ENV),
+        shutil.which("chromedriver"),
+        *CHROMEDRIVER_CANDIDATES,
+    )
+
+
+def _version_output(path: str | None) -> str:
+    if not path:
+        return "not found"
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip() or f"exit={result.returncode}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _read_tail(path: Path, max_chars: int = 2000) -> str:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:]
+
+
+def _build_chrome_options(chrome_binary: str | None, headless_arg: str | None) -> Any:
+    options = ChromeOptions()
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    if headless_arg:
+        options.add_argument(headless_arg)
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument("--window-size=1440,1200")
+    options.add_argument("--lang=ko-KR")
+    options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='musinsa-chrome-')}")
+    options.set_capability("pageLoadStrategy", "eager")
+    return options
+
+
+def _create_colab_selenium_driver(headless: bool) -> Any:
+    try:
+        import google_colab_selenium as gs  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "Colab 드라이버 provider를 쓰려면 `%pip install google-colab-selenium`이 필요합니다."
+        ) from exc
+
+    chrome_binary = _chrome_binary_candidates()[0] if _chrome_binary_candidates() else None
+    headless_arg = "--headless=new" if headless else None
+    options = _build_chrome_options(chrome_binary, headless_arg)
+
+    try:
+        driver = gs.Chrome(options=options)
+    except TypeError:
+        driver = gs.Chrome()
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
+
+
 def _resolve_browser(browser: str) -> str:
     """`auto` 라면 사용 가능한 드라이버를 골라 'firefox' 또는 'chrome'을 반환."""
     browser = (browser or "auto").lower()
@@ -82,11 +177,8 @@ def _resolve_browser(browser: str) -> str:
 
     if SNAP_GECKODRIVER.exists() or shutil.which("geckodriver"):
         return "firefox"
-    chrome_binary = _env_executable(CHROME_BINARY_ENV)
-    chrome_binary = chrome_binary or shutil.which("google-chrome") or shutil.which("chromium")
-    chrome_binary = chrome_binary or _first_existing_executable(*CHROME_BINARY_CANDIDATES)
-    chromedriver = _env_executable(CHROMEDRIVER_ENV)
-    chromedriver = chromedriver or shutil.which("chromedriver") or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
+    chrome_binary = _chrome_binary_candidates()[0] if _chrome_binary_candidates() else None
+    chromedriver = _chromedriver_candidates()[0] if _chromedriver_candidates() else None
     if _CHROME_AVAILABLE and (chromedriver or chrome_binary):
         return "chrome"
     return "firefox"
@@ -123,56 +215,76 @@ def _create_chrome_driver(headless: bool) -> Any:
     if not _CHROME_AVAILABLE:
         raise RuntimeError("selenium.webdriver.chrome 가 import 되지 않습니다.")
 
-    options = ChromeOptions()
+    provider = os.environ.get(CHROME_PROVIDER_ENV, "auto").strip().lower()
+    if provider in ("colab", "google-colab-selenium"):
+        return _create_colab_selenium_driver(headless)
+    if provider not in ("auto", "selenium", "webdriver"):
+        raise RuntimeError(
+            f"{CHROME_PROVIDER_ENV}={provider} 는 지원하지 않습니다. "
+            "auto, selenium, colab 중 하나를 사용하세요."
+        )
+    if provider == "auto" and _is_colab():
+        try:
+            return _create_colab_selenium_driver(headless)
+        except RuntimeError as exc:
+            log_warn(f"google-colab-selenium provider 사용 실패, Selenium 직접 실행으로 전환: {exc}")
 
-    chrome_binary = _env_executable(CHROME_BINARY_ENV)
-    chrome_binary = chrome_binary or (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("google-chrome")
-        or shutil.which("google-chrome-stable")
-        or _first_existing_executable(*CHROME_BINARY_CANDIDATES)
-    )
+    chrome_binary = _chrome_binary_candidates()[0] if _chrome_binary_candidates() else None
 
-    if chrome_binary:
-        options.binary_location = chrome_binary
-    else:
+    if not chrome_binary:
         raise RuntimeError(
             "Chrome/Chromium 실행 파일을 찾지 못했습니다. "
             f"Colab에서 찾은 경로를 os.environ['{CHROME_BINARY_ENV}']에 넣거나, "
             "Colab에서 chromium 또는 chromium-browser를 설치하세요."
         )
 
-    if headless:
-        options.add_argument("--headless=new")
+    chromedriver_paths = _chromedriver_candidates()
 
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1440,1200")
-    options.add_argument("--lang=ko-KR")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-software-rasterizer")
-
-    options.set_capability("pageLoadStrategy", "eager")
-
-    chromedriver_path = _env_executable(CHROMEDRIVER_ENV)
-    chromedriver_path = chromedriver_path or shutil.which("chromedriver")
-    chromedriver_path = chromedriver_path or _first_existing_executable(*CHROMEDRIVER_CANDIDATES)
-
-    if not chromedriver_path:
+    if not chromedriver_paths:
         raise RuntimeError(
             "chromedriver를 찾지 못했습니다. "
             f"Colab에서 찾은 경로를 os.environ['{CHROMEDRIVER_ENV}']에 넣거나, "
             "Colab에서 chromium-driver 또는 chromium-chromedriver를 설치하세요."
         )
 
-    service = ChromeService(executable_path=chromedriver_path)
+    errors: list[str] = []
+    headless_args = ["--headless=new", "--headless"] if headless else [None]
+    for headless_arg in headless_args:
+        for chromedriver_path in chromedriver_paths:
+            log_path = Path(tempfile.gettempdir()) / f"musinsa-chromedriver-{os.getpid()}.log"
+            try:
+                service = ChromeService(
+                    executable_path=chromedriver_path,
+                    log_output=str(log_path),
+                )
+                driver = webdriver.Chrome(
+                    service=service,
+                    options=_build_chrome_options(chrome_binary, headless_arg),
+                )
+                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+                return driver
+            except WebDriverException as exc:
+                errors.append(
+                    "\n".join(
+                        [
+                            f"driver={chromedriver_path}",
+                            f"driver_version={_version_output(chromedriver_path)}",
+                            f"chrome={chrome_binary}",
+                            f"chrome_version={_version_output(chrome_binary)}",
+                            f"headless={headless_arg or 'off'}",
+                            f"error={exc}",
+                            f"log={_read_tail(log_path)}",
+                        ]
+                    )
+                )
 
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    return driver
+    detail = "\n\n---\n\n".join(errors[-3:])
+    raise RuntimeError(
+        "Chrome WebDriver 시작에 실패했습니다. Colab이면 "
+        "`%pip install google-colab-selenium` 후 "
+        "`os.environ['MUSINSA_CHROME_PROVIDER']='colab'`을 설정해서 실행하세요.\n\n"
+        f"{detail}"
+    )
 
 
 def create_driver(headless: bool, browser: str = "auto") -> Any:

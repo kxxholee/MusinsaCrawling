@@ -76,29 +76,15 @@ else:
     !git clone {REPO_URL} {REPO_DIR}
     %cd {REPO_DIR}
 
-%pip install -q -e .
-!apt-get update -qq
-!apt-get install -y -qq chromium-chromedriver
-!which chromium || which chromium-browser || which google-chrome
-!which chromedriver
+%pip install -q -e . google-colab-selenium
 
 import os
-import shutil
 import sys
 
-chrome_binary = (
-    shutil.which("chromium")
-    or shutil.which("chromium-browser")
-    or shutil.which("google-chrome")
-)
-chromedriver = shutil.which("chromedriver")
-
-os.environ["MUSINSA_CHROME_BINARY"] = chrome_binary or ""
-os.environ["MUSINSA_CHROMEDRIVER"] = chromedriver or ""
+os.environ["MUSINSA_CHROME_PROVIDER"] = "colab"
 
 print(sys.executable)
-print("chrome:", os.environ["MUSINSA_CHROME_BINARY"])
-print("chromedriver:", os.environ["MUSINSA_CHROMEDRIVER"])
+print("chrome provider:", os.environ["MUSINSA_CHROME_PROVIDER"])
 
 from musinsa.browser import create_driver
 driver = create_driver(headless=True, browser="chrome")
