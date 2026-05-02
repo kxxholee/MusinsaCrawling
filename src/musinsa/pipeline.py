@@ -3,18 +3,18 @@ from __future__ import annotations
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from rich.table import Table
+
 from .categories import discover_category_tree
-from .checkpoint import append_rows_csv
 from .config import BRAND, DEFAULT_OUTPUT, GENDER_FILTER
 from .detail import collect_detail_and_options
 from .driver_pool import DriverPool
 from .excel import save_excel
 from .listing import collect_products_from_category
-from .logger import log_error, log_info, log_ok, log_warn, make_progress, rule
+from .logger import console, log_error, log_info, log_ok, log_warn, make_progress, rule
 from .schemas import OptionRow, ProductRow, SkuRow
 
 
@@ -73,10 +73,53 @@ def dedupe_products(products: List[ProductRow]) -> List[ProductRow]:
     return result
 
 
-def make_checkpoint_dir(output_path: Path) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def make_major_task_description(
+    major_code: str,
+    major_name: str,
+    raw_count: int,
+    added_count: int,
+    error_count: int,
+) -> str:
+    description = (
+        f"{major_code} {major_name} "
+        f"· 후보 {raw_count}개 "
+        f"· 추가 {added_count}개"
+    )
 
-    return output_path.with_name(f"{output_path.stem}_checkpoint_{timestamp}")
+    if error_count:
+        description += f" · 오류 {error_count}개"
+
+    return description
+
+
+def print_major_summary(major_stats: Dict[str, Dict[str, Any]]) -> None:
+    table = Table(title="상위 카테고리별 목록 수집 결과")
+
+    table.add_column("상위 코드", justify="center")
+    table.add_column("상위 카테고리")
+    table.add_column("하위 카테고리 수", justify="right")
+    table.add_column("후보 수", justify="right")
+    table.add_column("추가 상품 수", justify="right")
+    table.add_column("중복 제외 수", justify="right")
+    table.add_column("오류", justify="right")
+
+    for major_code in sorted(major_stats.keys()):
+        stat = major_stats[major_code]
+        raw_count = int(stat["raw_count"])
+        added_count = int(stat["added_count"])
+        duplicate_count = max(raw_count - added_count, 0)
+
+        table.add_row(
+            major_code,
+            str(stat["major_name"]),
+            str(stat["sub_count"]),
+            str(raw_count),
+            str(added_count),
+            str(duplicate_count),
+            str(stat["error_count"]),
+        )
+
+    console.print(table)
 
 
 def main(
@@ -92,13 +135,12 @@ def main(
     max_products_resolved: Optional[int] = None if max_products == 0 else max_products
 
     output_path = Path(output)
-    checkpoint_dir = make_checkpoint_dir(output_path)
 
     rule("무신사 스탠다드 여성 SKU 생성기 데모")
 
     log_info(f"브랜드: {BRAND}")
     log_info(f"여성 필터: gf={GENDER_FILTER} 고정")
-    log_info("카테고리: 런타임에 동적 발견 (서브카테고리 단위 크롤)")
+    log_info("카테고리: 상위 3자리 카테고리별 진행률 표시")
     log_info(
         f"카테고리별 최대 상품 수: "
         f"{'전체' if max_products_resolved is None else max_products_resolved}"
@@ -106,7 +148,6 @@ def main(
     log_info(f"옵션 수집: {'건너뜀' if skip_options else '실행'}")
     log_info(f"브라우저: {browser}")
     log_info(f"저장 파일: {output_path}")
-    log_info(f"중간 저장 폴더: {checkpoint_dir}")
 
     all_products: List[ProductRow] = []
     all_options: List[OptionRow] = []
@@ -119,6 +160,7 @@ def main(
     pool = DriverPool(size=workers_resolved, headless=headless, browser=browser)
 
     category_tree: List[Dict[str, Any]] = []
+    major_stats: Dict[str, Dict[str, Any]] = {}
 
     try:
         with pool.borrow() as driver:
@@ -131,30 +173,61 @@ def main(
         work_units: List[Dict[str, str]] = []
 
         for major in category_tree:
-            for sub in major["subs"]:
+            subs = major["subs"]
+            major_code = str(major.get("major_code") or "").strip()
+
+            if not major_code and subs:
+                major_code = str(subs[0].get("code", ""))[:3]
+
+            major_name = str(major.get("major_name") or major_code).strip()
+
+            # +1 = major-code (3자리) catch-all unit. 무신사는 상품을 major에만
+            # 태깅하고 sub에 누락시키는 경우가 많아 (예: 상의 771 vs sub 합산 206),
+            # 메이저 코드 한 번 더 호출해 글로벌 seen_product_ids 로 dedupe 한다.
+            major_stats[major_code] = {
+                "major_name": major_name,
+                "sub_count": len(subs) + 1,
+                "raw_count": 0,
+                "added_count": 0,
+                "error_count": 0,
+            }
+
+            for sub in subs:
+                category_code = str(sub["code"])
+
                 work_units.append(
                     {
-                        "major_category": major["major_name"],
-                        "category_code": sub["code"],
-                        "raw_category": sub["name"],
+                        "major_code": major_code,
+                        "major_category": major_name,
+                        "category_code": category_code,
+                        "raw_category": str(sub["name"]),
                     }
                 )
 
-        append_rows_csv(
-            checkpoint_dir / "category_master.csv",
-            [
-                {
-                    "major_category": major["major_name"],
-                    "category_code": sub["code"],
-                    "raw_category": sub["name"],
-                }
-                for major in category_tree
-                for sub in major["subs"]
-            ],
-        )
+            if major_code:
+                work_units.append(
+                    {
+                        "major_code": major_code,
+                        "major_category": major_name,
+                        "category_code": major_code,
+                        "raw_category": f"{major_name}(미분류)",
+                    }
+                )
 
         with make_progress() as progress:
-            listing_task = progress.add_task("서브카테고리 수집", total=len(work_units))
+            major_tasks: Dict[str, int] = {}
+
+            for major_code, stat in major_stats.items():
+                major_tasks[major_code] = progress.add_task(
+                    make_major_task_description(
+                        major_code=major_code,
+                        major_name=str(stat["major_name"]),
+                        raw_count=0,
+                        added_count=0,
+                        error_count=0,
+                    ),
+                    total=int(stat["sub_count"]),
+                )
 
             seen_product_ids: set = set()
 
@@ -173,29 +246,37 @@ def main(
 
                 for future in as_completed(futures):
                     unit = futures[future]
+                    major_code = unit["major_code"]
+                    stat = major_stats[major_code]
+                    task_id = major_tasks[major_code]
 
                     try:
                         rows = future.result()
 
                     except Exception as exc:
-                        log_error(f"{unit['category_code']} 수집 실패: {exc}")
+                        stat["error_count"] += 1
 
-                        append_rows_csv(
-                            checkpoint_dir / "listing_errors.csv",
-                            [
-                                {
-                                    "major_category": unit.get("major_category", ""),
-                                    "category_code": unit.get("category_code", ""),
-                                    "raw_category": unit.get("raw_category", ""),
-                                    "error": repr(exc),
-                                }
-                            ],
+                        log_error(
+                            f"{unit['major_code']} / "
+                            f"{unit['category_code']} 수집 실패: {exc}"
                         )
 
-                        progress.advance(listing_task)
+                        progress.update(
+                            task_id,
+                            description=make_major_task_description(
+                                major_code=major_code,
+                                major_name=str(stat["major_name"]),
+                                raw_count=int(stat["raw_count"]),
+                                added_count=int(stat["added_count"]),
+                                error_count=int(stat["error_count"]),
+                            ),
+                        )
+                        progress.advance(task_id)
+
                         continue
 
-                    new_rows: List[ProductRow] = []
+                    added_count = 0
+                    stat["raw_count"] += len(rows)
 
                     for row in rows:
                         key = row.product_id or row.product_url
@@ -205,11 +286,21 @@ def main(
 
                         seen_product_ids.add(key)
                         all_products.append(row)
-                        new_rows.append(row)
+                        added_count += 1
 
-                    append_rows_csv(checkpoint_dir / "products_listing.csv", new_rows)
+                    stat["added_count"] += added_count
 
-                    progress.advance(listing_task)
+                    progress.update(
+                        task_id,
+                        description=make_major_task_description(
+                            major_code=major_code,
+                            major_name=str(stat["major_name"]),
+                            raw_count=int(stat["raw_count"]),
+                            added_count=int(stat["added_count"]),
+                            error_count=int(stat["error_count"]),
+                        ),
+                    )
+                    progress.advance(task_id)
 
             log_ok(f"[목록 수집 완료] 중복 제거 후 상품 수: {len(all_products)}")
 
@@ -238,39 +329,12 @@ def main(
 
                             updated_by_id[src.product_id or src.product_url] = src
 
-                            append_rows_csv(
-                                checkpoint_dir / "detail_errors.csv",
-                                [
-                                    {
-                                        "product_id": src.product_id,
-                                        "product_name": src.product_name,
-                                        "product_url": src.product_url,
-                                        "major_category": src.major_category,
-                                        "raw_category": src.raw_category,
-                                        "error": repr(exc),
-                                    }
-                                ],
-                            )
-
                             progress.advance(detail_task)
                             continue
 
                         updated_by_id[
                             updated_product.product_id or updated_product.product_url
                         ] = updated_product
-
-                        append_rows_csv(
-                            checkpoint_dir / "products_detail.csv",
-                            [updated_product],
-                        )
-                        append_rows_csv(
-                            checkpoint_dir / "options_raw.csv",
-                            option_rows,
-                        )
-                        append_rows_csv(
-                            checkpoint_dir / "sku_result.csv",
-                            sku_rows,
-                        )
 
                         all_options.extend(option_rows)
                         all_skus.extend(sku_rows)
@@ -287,26 +351,22 @@ def main(
 
         log_info("[엑셀 저장]")
 
-        try:
-            save_excel(
-                output_path=output_path,
-                products=all_products,
-                options=all_options,
-                sku_rows=all_skus,
-                category_tree=category_tree,
-            )
-
-        except Exception as exc:
-            log_error(f"엑셀 저장 실패: {exc}")
-            log_warn("엑셀 저장은 실패했지만 중간 CSV 파일은 남아 있습니다.")
-            log_warn(f"중간 저장 폴더를 확인하세요: {checkpoint_dir.resolve()}")
+        save_excel(
+            output_path=output_path,
+            products=all_products,
+            options=all_options,
+            sku_rows=all_skus,
+            category_tree=category_tree,
+        )
 
     rule("완료")
+
+    if major_stats:
+        print_major_summary(major_stats)
 
     log_ok(f"상품 행 수: {len(all_products)}")
     log_ok(f"옵션 행 수: {len(all_options)}")
     log_ok(f"SKU 행 수: {len(all_skus)}")
     log_ok(f"저장 위치: {output_path.resolve()}")
-    log_ok(f"중간 저장 위치: {checkpoint_dir.resolve()}")
 
     return output_path
