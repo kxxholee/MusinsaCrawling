@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,9 +14,14 @@ from .config import BRAND, DEFAULT_OUTPUT, GENDER_FILTER
 from .detail import collect_detail_and_options
 from .driver_pool import DriverPool
 from .excel import save_excel
-from .listing import collect_products_from_category
+from .listing import collect_products_from_category, gather_listings_async
 from .logger import console, log_error, log_info, log_ok, log_warn, make_progress, rule
 from .schemas import OptionRow, ProductRow, SkuRow
+
+
+# 비동기 listing 동시성. workers (드라이버 수) 와 무관하게 HTTP-only 경로라
+# 더 높은 값을 써도 안전하다. 너무 높이면 무신사가 rate-limit 가능.
+LISTING_CONCURRENCY = 16
 
 
 def crawl_listing_unit(
@@ -51,26 +57,6 @@ def crawl_detail_unit(
         time.sleep(delay)
 
         return result
-
-
-def dedupe_products(products: List[ProductRow]) -> List[ProductRow]:
-    """같은 상품 중복 제거. 대분류가 다르면 별도 행으로 유지."""
-    result: List[ProductRow] = []
-    seen = set()
-
-    for product in products:
-        key = (
-            product.major_category,
-            product.product_id or product.product_url,
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(product)
-
-    return result
 
 
 def make_major_task_description(
@@ -230,36 +216,103 @@ def main(
                 )
 
             seen_product_ids: set = set()
+            fallback_units: List[Dict[str, str]] = []
 
-            with ThreadPoolExecutor(max_workers=workers_resolved) as executor:
-                futures = {
-                    executor.submit(
-                        crawl_listing_unit,
-                        pool,
-                        unit,
-                        max_products_resolved,
-                        max_scrolls,
-                        delay,
-                    ): unit
-                    for unit in work_units
-                }
+            def on_listing_done(
+                unit: Dict[str, str],
+                rows: List[ProductRow],
+                api_confirmed: bool,
+            ) -> None:
+                major_code = unit["major_code"]
+                stat = major_stats[major_code]
+                task_id = major_tasks[major_code]
 
-                for future in as_completed(futures):
-                    unit = futures[future]
-                    major_code = unit["major_code"]
-                    stat = major_stats[major_code]
-                    task_id = major_tasks[major_code]
+                if not api_confirmed and not rows:
+                    fallback_units.append(unit)
 
-                    try:
-                        rows = future.result()
+                stat["raw_count"] += len(rows)
+                added = 0
 
-                    except Exception as exc:
-                        stat["error_count"] += 1
+                for row in rows:
+                    key = row.product_id or row.product_url
 
-                        log_error(
-                            f"{unit['major_code']} / "
-                            f"{unit['category_code']} 수집 실패: {exc}"
-                        )
+                    if not key or key in seen_product_ids:
+                        continue
+
+                    seen_product_ids.add(key)
+                    all_products.append(row)
+                    added += 1
+
+                stat["added_count"] += added
+
+                progress.update(
+                    task_id,
+                    description=make_major_task_description(
+                        major_code=major_code,
+                        major_name=str(stat["major_name"]),
+                        raw_count=int(stat["raw_count"]),
+                        added_count=int(stat["added_count"]),
+                        error_count=int(stat["error_count"]),
+                    ),
+                )
+                progress.advance(task_id)
+
+            asyncio.run(
+                gather_listings_async(
+                    work_units=work_units,
+                    max_products=max_products_resolved,
+                    concurrency=LISTING_CONCURRENCY,
+                    on_done=on_listing_done,
+                )
+            )
+
+            # API 가 응답 자체를 안 준 work_unit 만 Selenium 폴백 (대개 0건).
+            if fallback_units:
+                log_warn(f"API 응답 실패 {len(fallback_units)}건 → Selenium 폴백")
+
+                with ThreadPoolExecutor(max_workers=workers_resolved) as executor:
+                    futures = {
+                        executor.submit(
+                            crawl_listing_unit,
+                            pool,
+                            unit,
+                            max_products_resolved,
+                            max_scrolls,
+                            delay,
+                        ): unit
+                        for unit in fallback_units
+                    }
+
+                    for future in as_completed(futures):
+                        unit = futures[future]
+                        major_code = unit["major_code"]
+                        stat = major_stats[major_code]
+                        task_id = major_tasks[major_code]
+
+                        try:
+                            rows = future.result()
+                        except Exception as exc:
+                            stat["error_count"] += 1
+                            log_error(
+                                f"{unit['major_code']} / "
+                                f"{unit['category_code']} 폴백 실패: {exc}"
+                            )
+                            continue
+
+                        stat["raw_count"] += len(rows)
+                        added = 0
+
+                        for row in rows:
+                            key = row.product_id or row.product_url
+
+                            if not key or key in seen_product_ids:
+                                continue
+
+                            seen_product_ids.add(key)
+                            all_products.append(row)
+                            added += 1
+
+                        stat["added_count"] += added
 
                         progress.update(
                             task_id,
@@ -271,36 +324,6 @@ def main(
                                 error_count=int(stat["error_count"]),
                             ),
                         )
-                        progress.advance(task_id)
-
-                        continue
-
-                    added_count = 0
-                    stat["raw_count"] += len(rows)
-
-                    for row in rows:
-                        key = row.product_id or row.product_url
-
-                        if not key or key in seen_product_ids:
-                            continue
-
-                        seen_product_ids.add(key)
-                        all_products.append(row)
-                        added_count += 1
-
-                    stat["added_count"] += added_count
-
-                    progress.update(
-                        task_id,
-                        description=make_major_task_description(
-                            major_code=major_code,
-                            major_name=str(stat["major_name"]),
-                            raw_count=int(stat["raw_count"]),
-                            added_count=int(stat["added_count"]),
-                            error_count=int(stat["error_count"]),
-                        ),
-                    )
-                    progress.advance(task_id)
 
             log_ok(f"[목록 수집 완료] 중복 제거 후 상품 수: {len(all_products)}")
 

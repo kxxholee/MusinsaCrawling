@@ -243,38 +243,85 @@ def build_sku_summary_sheet(
                 cell.alignment = left_wrap if cell.column == 3 else center
 
 
+_URL_COLUMNS = ("product_url", "source_category_url")
+
+
+def _normalize_cell_value(column: str, value: Any) -> Any:
+    """openpyxl 셀에 그대로 넣을 수 있게 None/URL 정규화."""
+    if value is None:
+        return ""
+    if column in _URL_COLUMNS and isinstance(value, str) and value:
+        return ensure_gender_filter_url(value)
+    return value
+
+
+def _append_dataclass_sheet(ws: Any, rows: Iterable[Any], columns: List[str]) -> None:
+    """ProductRow/OptionRow/SkuRow 같은 dataclass 리스트를 헤더 + 데이터로 append."""
+    ws.append(columns)
+    for row in rows:
+        record = row.__dict__
+        ws.append([_normalize_cell_value(col, record.get(col)) for col in columns])
+
+
+def _append_dict_sheet(ws: Any, rows: Iterable[Dict[str, Any]], columns: List[str]) -> None:
+    ws.append(columns)
+    for row in rows:
+        ws.append([_normalize_cell_value(col, row.get(col)) for col in columns])
+
+
+def _append_model_summary_sheet(ws: Any, df: "pd.DataFrame") -> None:
+    columns = list(df.columns)
+    ws.append(columns)
+
+    if df.empty:
+        return
+
+    for record in df.to_dict(orient="records"):
+        ws.append([_normalize_cell_value(col, record.get(col)) for col in columns])
+
+
+def _apply_raw_sheet_styles(ws: Any) -> None:
+    """헤더 스타일 / 첫 행 고정 / 자동 필터 / 자동 컬럼 폭 적용 (워크북 인메모리)."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    if ws.max_row < 1 or ws.max_column < 1:
+        return
+
+    header_fill = PatternFill("solid", fgColor="EDEDED")
+    header_font = Font(bold=True)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for column_cells in ws.columns:
+        max_len = 0
+        col_letter = column_cells[0].column_letter
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > max_len:
+                max_len = len(value)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 45)
+
+
 def adjust_excel_format(output_path: Path, skip_sheets: Optional[Set[str]] = None) -> None:
-    """openpyxl로 raw 시트들에 헤더 스타일·자동필터·열 너비 적용. SKU_요약은 건드리지 않음."""
+    """기존 파일에 raw 시트 스타일을 다시 적용 (외부 진입점). SKU_요약은 건드리지 않음."""
     try:
         from openpyxl import load_workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
     except ImportError:
         return
 
     skip = skip_sheets or set()
     wb = load_workbook(output_path)
 
-    header_fill = PatternFill("solid", fgColor="EDEDED")
-    header_font = Font(bold=True)
-
     for ws in wb.worksheets:
         if ws.title in skip:
             continue
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-        for cell in ws[1]:
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
-
-        for column_cells in ws.columns:
-            max_len = 0
-            col_letter = column_cells[0].column_letter
-            for cell in column_cells:
-                value = "" if cell.value is None else str(cell.value)
-                max_len = max(max_len, len(value))
-            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 45)
+        _apply_raw_sheet_styles(ws)
 
     wb.save(output_path)
 
@@ -286,35 +333,53 @@ def save_excel(
     sku_rows: List[SkuRow],
     category_tree: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """SKU_요약(보고서형)을 맨 앞에, 모델/원본 시트를 뒤에 둔다."""
-    from openpyxl import load_workbook
+    """SKU_요약(보고서형)을 맨 앞에, 모델/원본 시트를 뒤에 두는 단일 패스 워크북.
+
+    pandas DataFrame 사본 + 두 번째 load_workbook 패스를 모두 없애 피크 메모리를
+    크게 줄였다. SKU_요약 시트는 random-access cell 쓰기가 필요해 일반 모드를
+    유지하지만, raw 시트들은 dataclass → tuple → ws.append() 로 스트리밍한다.
+    """
+    from openpyxl import Workbook
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    master_rows = category_tree_to_master_rows(category_tree or [])
-    category_df = pd.DataFrame(
-        master_rows,
-        columns=["major_category", "major_code", "category_code", "raw_category"],
-    )
-    products_df = normalize_url_columns(pd.DataFrame(dataclass_list_to_dicts(products)))
-    options_df = normalize_url_columns(pd.DataFrame(dataclass_list_to_dicts(options)))
-    sku_df = normalize_url_columns(pd.DataFrame(dataclass_list_to_dicts(sku_rows)))
-    model_summary_df = normalize_url_columns(build_model_summary_df(products, sku_rows))
+    # 모델 단위 집계는 pandas groupby 가 단순해서 여기서만 DataFrame 사용.
+    model_summary_df = build_model_summary_df(products, sku_rows)
+    if not model_summary_df.empty:
+        model_summary_df = normalize_url_columns(model_summary_df)
 
-    products_df = products_df.reindex(columns=list(ProductRow.__annotations__.keys()))
-    options_df = options_df.reindex(columns=list(OptionRow.__annotations__.keys()))
-    sku_df = sku_df.reindex(columns=list(SkuRow.__annotations__.keys()))
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        model_summary_df.to_excel(writer, sheet_name="model_summary", index=False)
-        products_df.to_excel(writer, sheet_name="products_raw", index=False)
-        options_df.to_excel(writer, sheet_name="options_raw", index=False)
-        sku_df.to_excel(writer, sheet_name="sku_result", index=False)
-        category_df.to_excel(writer, sheet_name="category_master", index=False)
-
-    wb = load_workbook(output_path)
-    summary_ws = wb.create_sheet("SKU_요약", 0)
+    wb = Workbook()
+    # 기본 생성 시트는 SKU_요약 이름으로 곧바로 사용 (시트 인덱스 0).
+    summary_ws = wb.active
+    summary_ws.title = "SKU_요약"
     build_sku_summary_sheet(summary_ws, products, sku_rows, category_tree=category_tree)
-    wb.save(output_path)
 
-    adjust_excel_format(output_path, skip_sheets={"SKU_요약"})
+    model_ws = wb.create_sheet("model_summary")
+    _append_model_summary_sheet(model_ws, model_summary_df)
+    _apply_raw_sheet_styles(model_ws)
+
+    products_ws = wb.create_sheet("products_raw")
+    _append_dataclass_sheet(
+        products_ws, products, list(ProductRow.__annotations__.keys())
+    )
+    _apply_raw_sheet_styles(products_ws)
+
+    options_ws = wb.create_sheet("options_raw")
+    _append_dataclass_sheet(
+        options_ws, options, list(OptionRow.__annotations__.keys())
+    )
+    _apply_raw_sheet_styles(options_ws)
+
+    sku_ws = wb.create_sheet("sku_result")
+    _append_dataclass_sheet(sku_ws, sku_rows, list(SkuRow.__annotations__.keys()))
+    _apply_raw_sheet_styles(sku_ws)
+
+    category_ws = wb.create_sheet("category_master")
+    _append_dict_sheet(
+        category_ws,
+        category_tree_to_master_rows(category_tree or []),
+        ["major_category", "major_code", "category_code", "raw_category"],
+    )
+    _apply_raw_sheet_styles(category_ws)
+
+    wb.save(output_path)

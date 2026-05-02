@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import aiohttp
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import WebDriverException
 
@@ -297,19 +299,6 @@ def _extract_pagination_info(data: Dict[str, Any]) -> tuple[Optional[int], Optio
     return total_pages, total_count, has_next
 
 
-def fetch_product_items_from_plp_api(
-    category_code: str,
-    max_products: Optional[int],
-) -> List[Dict[str, Any]]:
-    """무신사 PLP JSON API에서 브랜드 상품 목록을 수집한다."""
-    items, _api_confirmed = fetch_product_items_from_plp_api_checked(
-        category_code=category_code,
-        max_products=max_products,
-    )
-
-    return items
-
-
 def fetch_product_items_from_plp_api_checked(
     category_code: str,
     max_products: Optional[int],
@@ -438,6 +427,135 @@ def fetch_product_items_from_plp_api_checked(
     return items, api_confirmed
 
 
+async def fetch_product_items_from_plp_api_async(
+    session: aiohttp.ClientSession,
+    category_code: str,
+    max_products: Optional[int],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """fetch_product_items_from_plp_api_checked 의 async 변형.
+
+    수십~수백 개 work_unit 을 asyncio.gather + Semaphore 로 동시에 돌리기 위한 경로.
+    페이지네이션 토큰(nextPageUrl) 처리는 sync 버전과 같다.
+    """
+    items: List[Dict[str, Any]] = []
+    seen: set = set()
+    page = 1
+    total_pages: Optional[int] = None
+    total_count: Optional[int] = None
+    has_next: Optional[bool] = None
+    no_new_page_count = 0
+    api_confirmed = False
+
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Origin": "https://www.musinsa.com",
+        "Referer": ensure_gender_filter_url(build_category_url(category_code)),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+            "Gecko/20100101 Firefox/124.0"
+        ),
+    }
+
+    initial_params: Dict[str, Any] = {
+        "gf": GENDER_FILTER,
+        "sortCode": "NEW",
+        "brand": BRAND,
+        "page": page,
+        "size": PLP_API_PAGE_SIZE,
+        "caller": "FLAGSHIP",
+    }
+
+    if category_code:
+        initial_params["category"] = category_code
+
+    next_url: Optional[str] = f"{PLP_API_URL}?{urlencode(initial_params)}"
+    timeout = aiohttp.ClientTimeout(total=PLP_API_TIMEOUT_SECONDS)
+
+    while next_url and page <= PLP_API_MAX_PAGES:
+        try:
+            async with session.get(next_url, headers=headers, timeout=timeout) as response:
+                if response.status >= 400:
+                    return items, api_confirmed
+
+                payload = await response.json(content_type=None)
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            return items, api_confirmed
+
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        goods_list = data.get("list") if isinstance(data, dict) else []
+
+        api_confirmed = True
+
+        if not isinstance(goods_list, list) or not goods_list:
+            break
+
+        page_total_pages, page_total_count, page_has_next = _extract_pagination_info(data)
+
+        if page_total_pages is not None:
+            total_pages = page_total_pages
+
+        if page_total_count is not None:
+            total_count = page_total_count
+
+        if page_has_next is not None:
+            has_next = page_has_next
+
+        pagination = data.get("pagination") if isinstance(data, dict) else None
+        next_page_url = (
+            clean_text(pagination.get("nextPageUrl", "")) if isinstance(pagination, dict) else ""
+        )
+
+        before_count = len(items)
+
+        for api_item in goods_list:
+            if not isinstance(api_item, dict):
+                continue
+
+            item = _api_item_to_listing_item(api_item)
+            product_url = ensure_gender_filter_url(item.get("product_url", ""))
+            product_id = extract_product_id(product_url)
+            key = product_id or product_url
+
+            if not key or key in seen:
+                continue
+
+            seen.add(key)
+            items.append(item)
+
+            if max_products is not None and len(items) >= max_products:
+                return items, api_confirmed
+
+            if total_count is not None and len(items) >= total_count:
+                return items, api_confirmed
+
+        if len(items) == before_count:
+            no_new_page_count += 1
+        else:
+            no_new_page_count = 0
+
+        if no_new_page_count >= PLP_API_MAX_NO_NEW_PAGES:
+            break
+
+        if total_pages is not None and page >= total_pages:
+            break
+
+        if has_next is False:
+            break
+
+        if total_pages is None and has_next is None and len(goods_list) < PLP_API_PAGE_SIZE:
+            break
+
+        if not next_page_url:
+            break
+
+        next_url = next_page_url
+        page += 1
+        await asyncio.sleep(PLP_API_SLEEP_SECONDS)
+
+    return items, api_confirmed
+
+
 def wait_for_product_items(
     driver: Any,
     timeout_seconds: float = PRODUCT_RENDER_TIMEOUT_SECONDS,
@@ -522,53 +640,18 @@ def scroll_and_collect_products(
     return list(items_by_key.values())
 
 
-def collect_products_from_category(
-    driver: Any,
+def items_to_product_rows(
+    raw_items: List[Dict[str, Any]],
     major_category: str,
     category_code: str,
+    raw_category: str,
     max_products: Optional[int],
-    max_scrolls: int,
-    raw_category: str = "미확인",
 ) -> List[ProductRow]:
-    category_url = build_category_url(category_code)
-
-    raw_items, api_confirmed = fetch_product_items_from_plp_api_checked(
-        category_code=category_code,
-        max_products=max_products,
-    )
-
-    if not raw_items and not api_confirmed:
-        if not safe_goto(driver, category_url):
-            return []
-
-        close_common_popups(driver)
-        initial_items = wait_for_product_items(driver)
-
-        for attempt in range(EMPTY_LISTING_RETRY_COUNT + 1):
-            raw_items = scroll_and_collect_products(
-                driver=driver,
-                max_scrolls=max_scrolls,
-                max_products=max_products,
-                initial_items=initial_items,
-            )
-
-            if raw_items or attempt >= EMPTY_LISTING_RETRY_COUNT:
-                break
-
-            try:
-                driver.refresh()
-                time.sleep(1.0)
-                close_common_popups(driver)
-
-            except WebDriverException:
-                safe_goto(driver, category_url)
-                close_common_popups(driver)
-
-            initial_items = wait_for_product_items(driver)
-
+    """API 또는 DOM 에서 모은 raw item 들을 ProductRow 로 변환."""
     rows: List[ProductRow] = []
-    seen_ids_or_urls = set()
+    seen_ids_or_urls: set = set()
     crawl_date = now_kst_str()
+    category_url = build_category_url(category_code)
 
     for item in raw_items:
         product_url = ensure_gender_filter_url(item.get("product_url", ""))
@@ -614,3 +697,109 @@ def collect_products_from_category(
             break
 
     return rows
+
+
+def collect_products_from_category(
+    driver: Any,
+    major_category: str,
+    category_code: str,
+    max_products: Optional[int],
+    max_scrolls: int,
+    raw_category: str = "미확인",
+) -> List[ProductRow]:
+    """단일 work_unit 동기 수집 — API 우선, 실패 시 Selenium 폴백."""
+    category_url = build_category_url(category_code)
+
+    raw_items, api_confirmed = fetch_product_items_from_plp_api_checked(
+        category_code=category_code,
+        max_products=max_products,
+    )
+
+    if not raw_items and not api_confirmed:
+        if not safe_goto(driver, category_url):
+            return []
+
+        close_common_popups(driver)
+        initial_items = wait_for_product_items(driver)
+
+        for attempt in range(EMPTY_LISTING_RETRY_COUNT + 1):
+            raw_items = scroll_and_collect_products(
+                driver=driver,
+                max_scrolls=max_scrolls,
+                max_products=max_products,
+                initial_items=initial_items,
+            )
+
+            if raw_items or attempt >= EMPTY_LISTING_RETRY_COUNT:
+                break
+
+            try:
+                driver.refresh()
+                time.sleep(1.0)
+                close_common_popups(driver)
+
+            except WebDriverException:
+                safe_goto(driver, category_url)
+                close_common_popups(driver)
+
+            initial_items = wait_for_product_items(driver)
+
+    return items_to_product_rows(
+        raw_items=raw_items,
+        major_category=major_category,
+        category_code=category_code,
+        raw_category=raw_category,
+        max_products=max_products,
+    )
+
+
+async def gather_listings_async(
+    work_units: List[Dict[str, str]],
+    max_products: Optional[int],
+    concurrency: int = 16,
+    on_done: Optional[Any] = None,
+) -> Dict[str, Tuple[List[ProductRow], bool]]:
+    """모든 work_unit 의 PLP API 호출을 동시에 실행하고 ProductRow 리스트로 반환.
+
+    반환값 key 는 work_unit["category_code"]. on_done 콜백이 주어지면
+    각 unit 완료 시점에 (unit, rows, api_confirmed) 로 호출되어 메인이 진행률을
+    바로 갱신할 수 있다. (이 콜백은 메인 스레드에서 실행됨)
+    """
+    if not work_units:
+        return {}
+
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    connector = aiohttp.TCPConnector(
+        limit=max(1, concurrency * 2),
+        limit_per_host=max(1, concurrency * 2),
+    )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async def one(unit: Dict[str, str]) -> Tuple[Dict[str, str], List[ProductRow], bool]:
+            async with semaphore:
+                items, api_confirmed = await fetch_product_items_from_plp_api_async(
+                    session=session,
+                    category_code=unit["category_code"],
+                    max_products=max_products,
+                )
+
+            rows = items_to_product_rows(
+                raw_items=items,
+                major_category=unit["major_category"],
+                category_code=unit["category_code"],
+                raw_category=unit["raw_category"],
+                max_products=max_products,
+            )
+
+            if on_done is not None:
+                try:
+                    on_done(unit, rows, api_confirmed)
+                except Exception:
+                    pass
+
+            return unit, rows, api_confirmed
+
+        tasks = [asyncio.create_task(one(u)) for u in work_units]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    return {unit["category_code"]: (rows, api_confirmed) for unit, rows, api_confirmed in results}
