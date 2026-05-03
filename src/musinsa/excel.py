@@ -264,6 +264,8 @@ def build_sku_summary_sheet(
 
         for raw_cat in raw_sequence:
             raw_df = major_df[major_df["raw_category"] == raw_cat].sort_values("product_id")
+            if raw_df.empty:
+                continue
 
             raw_total = int(raw_df["sku_count"].sum())
             raw_pct = raw_total / total_sku if total_sku else 0
@@ -271,39 +273,31 @@ def build_sku_summary_sheet(
             style_summary = "미분류: 100%"
 
             raw_start = current_row
-            if raw_df.empty:
-                ws.cell(row=current_row, column=3, value="")
-                ws.cell(row=current_row, column=4, value="")
-                ws.cell(row=current_row, column=5, value=0)
-                ws.cell(row=current_row, column=6, value=0)
-                ws.cell(row=current_row, column=7, value=0)
-                current_row += 1
-            else:
-                for _, model_df in raw_df.groupby("_report_group_key", sort=False):
-                    model_start = current_row
-                    model_name = str(model_df["_report_model_name"].iloc[0])
-                    colors = model_df["_report_color"].drop_duplicates().tolist()
-                    color_count = len(colors)
-                    report_key = str(model_df["_report_group_key"].iloc[0])
-                    size_count = size_count_by_report_key.get(report_key, 0)
-                    model_sku_count = model_sku_count_by_report_key.get(report_key, 0)
+            for _, model_df in raw_df.groupby("_report_group_key", sort=False):
+                model_start = current_row
+                model_name = str(model_df["_report_model_name"].iloc[0])
+                colors = model_df["_report_color"].drop_duplicates().tolist()
+                color_count = len(colors)
+                report_key = str(model_df["_report_group_key"].iloc[0])
+                size_count = size_count_by_report_key.get(report_key, 0)
+                model_sku_count = model_sku_count_by_report_key.get(report_key, 0)
 
-                    for color in colors:
-                        ws.cell(row=current_row, column=4, value=color)
-                        current_row += 1
+                for color in colors:
+                    ws.cell(row=current_row, column=4, value=color)
+                    current_row += 1
 
-                    model_end = current_row - 1
-                    ws.cell(row=model_start, column=3, value=model_name)
-                    ws.cell(row=model_start, column=5, value=color_count)
-                    ws.cell(row=model_start, column=6, value=int(size_count))
-                    ws.cell(row=model_start, column=7, value=model_sku_count)
+                model_end = current_row - 1
+                ws.cell(row=model_start, column=3, value=model_name)
+                ws.cell(row=model_start, column=5, value=color_count)
+                ws.cell(row=model_start, column=6, value=int(size_count))
+                ws.cell(row=model_start, column=7, value=model_sku_count)
 
-                    if model_end > model_start:
-                        for col in (3, 5, 6, 7):
-                            ws.merge_cells(
-                                start_row=model_start, end_row=model_end,
-                                start_column=col, end_column=col,
-                            )
+                if model_end > model_start:
+                    for col in (3, 5, 6, 7):
+                        ws.merge_cells(
+                            start_row=model_start, end_row=model_end,
+                            start_column=col, end_column=col,
+                        )
             raw_end = current_row - 1
 
             ws.cell(row=raw_start, column=2, value=raw_cat)

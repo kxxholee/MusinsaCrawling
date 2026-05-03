@@ -76,7 +76,10 @@ class SkuSummarySheetTest(unittest.TestCase):
                 {
                     "major_name": "상의",
                     "major_code": "001",
-                    "subs": [{"code": "001001", "name": "반소매 티셔츠"}],
+                    "subs": [
+                        {"code": "001001", "name": "반소매 티셔츠"},
+                        {"code": "001002", "name": "스커트"},
+                    ],
                 }
             ],
         )
@@ -96,7 +99,9 @@ class SkuSummarySheetTest(unittest.TestCase):
         self.assertEqual(ws["G2"].value, 9)
         self.assertEqual(ws["H2"].value, 9)
         self.assertEqual(ws["I2"].number_format, "0.00%")
-        self.assertIsNone(ws["D5"].value)
+        self.assertEqual(ws.max_row, 4)
+        self.assertNotIn("그레이", [ws.cell(row, 4).value for row in range(2, ws.max_row + 1)])
+        self.assertNotIn("스커트", [ws.cell(row, 2).value for row in range(2, ws.max_row + 1)])
 
         merged_ranges = {str(cell_range) for cell_range in ws.merged_cells.ranges}
         self.assertTrue({"C2:C4", "E2:E4", "F2:F4", "G2:G4"}.issubset(merged_ranges))
