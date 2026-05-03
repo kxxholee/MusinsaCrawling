@@ -34,10 +34,10 @@ commands:
 uv run python -m musinsa
 ```
 
-기존 `mgen.py` shim도 그대로 작동합니다:
+루트 스크립트로도 실행할 수 있습니다:
 
 ```bash
-uv run python mgen.py
+uv run python main.py
 ```
 
 ### commands.yaml 옵션
@@ -51,7 +51,7 @@ uv run python mgen.py
 - `workers` 병렬 드라이버 개수
 - `browser` `auto`, `firefox`, `chrome` 중 하나
 
-## Python에서 직접 호출 (Jupyter / Colab)
+## Python에서 직접 호출 (Jupyter)
 
 ```python
 from musinsa.pipeline import main
@@ -69,53 +69,6 @@ out_path = main(
 print(out_path)
 ```
 
-### Google Colab
-
-```python
-REPO_URL = "https://github.com/<user>/<repo>.git"
-REPO_DIR = "MusinsaCrawling"
-
-import os
-
-if os.path.isdir(REPO_DIR):
-    %cd {REPO_DIR}
-    !git pull
-else:
-    !git clone {REPO_URL} {REPO_DIR}
-    %cd {REPO_DIR}
-
-%pip install -q -e . google-colab-selenium
-
-import os
-import sys
-
-os.environ["MUSINSA_CHROME_PROVIDER"] = "colab"
-
-print(sys.executable)
-print("chrome provider:", os.environ["MUSINSA_CHROME_PROVIDER"])
-
-from musinsa.browser import create_driver
-driver = create_driver(headless=True, browser="chrome")
-driver.quit()
-
-from musinsa.pipeline import main
-
-out_path = main(
-    max_products=20,
-    max_scrolls=80,
-    delay=0.8,
-    headless=True,
-    skip_options=False,
-    workers=1,
-    browser="chrome",
-)
-
-from google.colab import files
-files.download(str(out_path))
-```
-
-Colab은 메모리/네트워크 제약 때문에 `workers=1` 또는 `2`를 권장합니다.
-
 ## 프로젝트 구조
 
 ```
@@ -132,6 +85,6 @@ src/musinsa/
   driver_pool.py     # ThreadPool용 드라이버 풀
   logger.py          # rich 기반 단일 Console + Progress
   pipeline.py        # main(**kwargs) 오케스트레이션
-  cli.py             # argparse + entrypoint
-mgen.py              # 역호환 shim (entrypoint 호출)
+  cli.py             # commands.yaml 로드 + entrypoint
+main.py              # 로컬 실행 shim (entrypoint 호출)
 ```

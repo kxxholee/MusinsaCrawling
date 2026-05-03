@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 무신사 스탠다드 여성 상품(브랜드 `musinsastandardwoman`, 필터 `gf=F`)을 Selenium + BeautifulSoup으로 동적 수집해 보고서형 `SKU_요약`과 검증용 raw 시트들을 포함한 엑셀을 만드는 데모입니다. Python 3.11, 패키지는 `uv` 관리.
 
-실제 진입점은 `python -m musinsa` (또는 `from musinsa.pipeline import main`) 입니다. [mgen.py](mgen.py)는 역호환 shim이고, [main.py](main.py)는 `uv init` 의 잔재이므로 사용하지 않습니다.
+실제 진입점은 `python -m musinsa` (또는 `from musinsa.pipeline import main`) 입니다. [main.py](main.py)는 로컬 실행용 shim입니다.
 
 ## 자주 쓰는 명령어
 
