@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 
 from .categories import category_tree_to_master_rows
 from .schemas import OptionRow, ProductRow, SkuRow
 from .utils import clean_text, dataclass_list_to_dicts, ensure_gender_filter_url
+
+
+COLOR_SUFFIX_RE = re.compile(r"\[([^\[\]]+)\]\s*$")
 
 
 def make_model_key_from_values(
@@ -70,6 +73,21 @@ def clean_model_name(raw_name: str) -> str:
     return name.strip()
 
 
+def split_report_model_name_and_color(raw_name: str) -> Tuple[str, str]:
+    """상품명 끝의 [색상] suffix 를 SKU_요약용 모델명/색상으로 분리."""
+    if not raw_name:
+        return "", ""
+
+    name = clean_text(raw_name)
+    match = COLOR_SUFFIX_RE.search(name)
+    if not match:
+        return clean_model_name(name), ""
+
+    model_name = clean_model_name(name[:match.start()].strip())
+    color = clean_text(match.group(1))
+    return model_name, color
+
+
 def format_price_summary(prices: Iterable[Optional[int]]) -> str:
     """중분류 단위 가격을 '최고/최저/평균원' 형식으로."""
     valid = [int(p) for p in prices if p is not None]
@@ -124,13 +142,14 @@ def build_sku_summary_sheet(
     sku_rows: List[SkuRow],
     category_tree: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """style.xlsx 양식의 SKU_요약 시트 — A열 대분류 / B,F,G,H,I열 중분류 단위 병합."""
+    """style.xlsx 양식의 SKU_요약 시트 — 모델명 색상 suffix 를 별도 열로 분리."""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     headers = [
-        "카테고리", "중분류", "모델명", "컬러 수", "사이즈 수",
-        "SKU 개수", "SKU 비중", "최고/최저/평균가", "베이직/뉴베이직/트렌디",
+        "카테고리", "중분류", "모델명", "색상", "컬러 수", "사이즈 수",
+        "모델 SKU 개수", "SKU 개수", "SKU 비중", "최고/최저/평균가",
+        "베이직/뉴베이직/트렌디",
     ]
     thin = Side(style="thin", color="999999")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -146,12 +165,69 @@ def build_sku_summary_sheet(
         cell.fill = header_fill
         cell.border = border
     ws.row_dimensions[1].height = 30
-    widths = {1: 18, 2: 16, 3: 38, 4: 8, 5: 8, 6: 12, 7: 12, 8: 26, 9: 22}
+    widths = {
+        1: 18, 2: 16, 3: 38, 4: 16, 5: 8, 6: 8,
+        7: 14, 8: 12, 9: 12, 10: 26, 11: 22,
+    }
     for col_idx, width in widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
     ws.freeze_panes = "A2"
 
     summary_df = build_model_summary_df(products, sku_rows)
+    if summary_df.empty:
+        return
+
+    summary_df = add_model_key_column(summary_df)
+    report_parts = summary_df["product_name"].map(split_report_model_name_and_color)
+    summary_df["_report_model_name"] = report_parts.map(lambda part: part[0])
+    summary_df["_report_color"] = report_parts.map(lambda part: part[1])
+    summary_df["_report_group_key"] = summary_df.apply(
+        lambda row: "|".join(
+            [
+                clean_text(row.get("major_category", "")),
+                clean_text(row.get("raw_category", "")),
+                clean_text(row.get("_report_model_name", "")),
+            ]
+        ),
+        axis=1,
+    )
+    summary_df = summary_df[summary_df["sku_count"] > 0]
+    if summary_df.empty:
+        return
+
+    size_count_by_report_key: Dict[str, int] = {}
+    if sku_rows:
+        sku_df = add_model_key_column(
+            normalize_url_columns(pd.DataFrame(dataclass_list_to_dicts(sku_rows)))
+        )
+        sku_df = sku_df.merge(
+            summary_df[["_model_key", "_report_group_key"]],
+            on="_model_key",
+            how="left",
+        )
+        size_count_by_report_key = (
+            sku_df.dropna(subset=["_report_group_key"])
+            .groupby("_report_group_key")["size"]
+            .nunique()
+            .astype(int)
+            .to_dict()
+        )
+
+    color_count_by_report_key = (
+        summary_df.groupby("_report_group_key")["_report_color"]
+        .nunique()
+        .astype(int)
+        .to_dict()
+    )
+    model_sku_count_by_report_key: Dict[str, int] = {
+        report_key: color_count * size_count_by_report_key.get(report_key, 0)
+        for report_key, color_count in color_count_by_report_key.items()
+    }
+    summary_df = summary_df[
+        summary_df["_report_group_key"].map(
+            lambda report_key: model_sku_count_by_report_key.get(str(report_key), 0) > 0
+        )
+    ]
     if summary_df.empty:
         return
 
@@ -197,26 +273,48 @@ def build_sku_summary_sheet(
             raw_start = current_row
             if raw_df.empty:
                 ws.cell(row=current_row, column=3, value="")
-                ws.cell(row=current_row, column=4, value=0)
+                ws.cell(row=current_row, column=4, value="")
                 ws.cell(row=current_row, column=5, value=0)
+                ws.cell(row=current_row, column=6, value=0)
+                ws.cell(row=current_row, column=7, value=0)
                 current_row += 1
             else:
-                for _, model in raw_df.iterrows():
-                    ws.cell(row=current_row, column=3, value=clean_model_name(model["product_name"]))
-                    ws.cell(row=current_row, column=4, value=int(model["color_count"]))
-                    ws.cell(row=current_row, column=5, value=int(model["size_count"]))
-                    current_row += 1
+                for _, model_df in raw_df.groupby("_report_group_key", sort=False):
+                    model_start = current_row
+                    model_name = str(model_df["_report_model_name"].iloc[0])
+                    colors = model_df["_report_color"].drop_duplicates().tolist()
+                    color_count = len(colors)
+                    report_key = str(model_df["_report_group_key"].iloc[0])
+                    size_count = size_count_by_report_key.get(report_key, 0)
+                    model_sku_count = model_sku_count_by_report_key.get(report_key, 0)
+
+                    for color in colors:
+                        ws.cell(row=current_row, column=4, value=color)
+                        current_row += 1
+
+                    model_end = current_row - 1
+                    ws.cell(row=model_start, column=3, value=model_name)
+                    ws.cell(row=model_start, column=5, value=color_count)
+                    ws.cell(row=model_start, column=6, value=int(size_count))
+                    ws.cell(row=model_start, column=7, value=model_sku_count)
+
+                    if model_end > model_start:
+                        for col in (3, 5, 6, 7):
+                            ws.merge_cells(
+                                start_row=model_start, end_row=model_end,
+                                start_column=col, end_column=col,
+                            )
             raw_end = current_row - 1
 
             ws.cell(row=raw_start, column=2, value=raw_cat)
-            ws.cell(row=raw_start, column=6, value=raw_total)
-            pct_cell = ws.cell(row=raw_start, column=7, value=raw_pct)
+            ws.cell(row=raw_start, column=8, value=raw_total)
+            pct_cell = ws.cell(row=raw_start, column=9, value=raw_pct)
             pct_cell.number_format = "0.00%"
-            ws.cell(row=raw_start, column=8, value=price_summary)
-            ws.cell(row=raw_start, column=9, value=style_summary)
+            ws.cell(row=raw_start, column=10, value=price_summary)
+            ws.cell(row=raw_start, column=11, value=style_summary)
 
             if raw_end > raw_start:
-                for col in (2, 6, 7, 8, 9):
+                for col in (2, 8, 9, 10, 11):
                     ws.merge_cells(
                         start_row=raw_start, end_row=raw_end,
                         start_column=col, end_column=col,
@@ -237,7 +335,7 @@ def build_sku_summary_sheet(
 
     last_row = current_row - 1
     if last_row >= 2:
-        for row in ws.iter_rows(min_row=2, max_row=last_row, min_col=1, max_col=9):
+        for row in ws.iter_rows(min_row=2, max_row=last_row, min_col=1, max_col=11):
             for cell in row:
                 cell.border = border
                 cell.alignment = left_wrap if cell.column == 3 else center
