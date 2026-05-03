@@ -12,6 +12,7 @@ from rich.table import Table
 from .categories import discover_category_tree
 from .config import BRAND, DEFAULT_OUTPUT, GENDER_FILTER
 from .detail import collect_detail_and_options
+from .detail_api import DETAIL_CONCURRENCY, gather_details_async
 from .driver_pool import DriverPool
 from .excel import save_excel
 from .listing import collect_products_from_category, gather_listings_async
@@ -334,35 +335,56 @@ def main(
                 )
 
                 updated_by_id: Dict[str, ProductRow] = {}
+                fallback_products: List[ProductRow] = []
 
-                with ThreadPoolExecutor(max_workers=workers_resolved) as executor:
-                    futures = {
-                        executor.submit(crawl_detail_unit, pool, product, delay): product
-                        for product in all_products
-                    }
+                def on_detail_done(
+                    product: ProductRow,
+                    options: List[OptionRow],
+                    skus: List[SkuRow],
+                    api_ok: bool,
+                ) -> None:
+                    if not api_ok:
+                        fallback_products.append(product)
+                    # api_ok 인데 옵션이 비면 옵션이 정말 없는 상품 — fallback 안 시도.
+                    updated_by_id[product.product_id or product.product_url] = product
+                    all_options.extend(options)
+                    all_skus.extend(skus)
+                    progress.advance(detail_task)
 
-                    for future in as_completed(futures):
-                        src = futures[future]
+                asyncio.run(
+                    gather_details_async(
+                        products=all_products,
+                        concurrency=DETAIL_CONCURRENCY,
+                        on_done=on_detail_done,
+                    )
+                )
 
-                        try:
-                            updated_product, option_rows, sku_rows = future.result()
+                # API 가 5xx/네트워크로 실패한 상품만 Selenium 폴백 (대개 0건).
+                if fallback_products:
+                    log_warn(
+                        f"옵션 API 실패 {len(fallback_products)}건 → Selenium 폴백"
+                    )
 
-                        except Exception as exc:
-                            log_error(f"{src.product_id} 상세 실패: {exc}")
+                    with ThreadPoolExecutor(max_workers=workers_resolved) as executor:
+                        futures = {
+                            executor.submit(crawl_detail_unit, pool, product, delay): product
+                            for product in fallback_products
+                        }
 
-                            updated_by_id[src.product_id or src.product_url] = src
+                        for future in as_completed(futures):
+                            src = futures[future]
 
-                            progress.advance(detail_task)
-                            continue
+                            try:
+                                updated_product, option_rows, sku_rows = future.result()
+                            except Exception as exc:
+                                log_error(f"{src.product_id} 폴백 실패: {exc}")
+                                continue
 
-                        updated_by_id[
-                            updated_product.product_id or updated_product.product_url
-                        ] = updated_product
-
-                        all_options.extend(option_rows)
-                        all_skus.extend(sku_rows)
-
-                        progress.advance(detail_task)
+                            updated_by_id[
+                                updated_product.product_id or updated_product.product_url
+                            ] = updated_product
+                            all_options.extend(option_rows)
+                            all_skus.extend(sku_rows)
 
                 all_products = [
                     updated_by_id.get(p.product_id or p.product_url, p)
